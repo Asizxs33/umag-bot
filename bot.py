@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    TelegramObject,
 )
 
 from config import ALLOWED_TELEGRAM_USER_IDS, TELEGRAM_BOT_TOKEN, UMAG_PASSWORD, UMAG_PHONE
@@ -43,16 +44,45 @@ class NewProduct(StatesGroup):
 class CashCheck(StatesGroup):
     morning_cash = State()
     evening_cash = State()
+    custom_date = State()
+
+
+class StockFlow(StatesGroup):
+    product = State()
+    quantity = State()
+    comment = State()
+
+
+# per-chat search results awaiting a pick via inline buttons
+_search_results: dict[int, list[dict]] = {}
 
 
 # last confirmed "Деньги вечером" per chat, used as next day's "Деньги утром"
 _last_evening_cash: dict[int, float] = {}
 
 
-def _allowed(message: Message) -> bool:
+def _allowed_user_id(user_id: int) -> bool:
     if not ALLOWED_TELEGRAM_USER_IDS:
         return True
-    return message.from_user.id in ALLOWED_TELEGRAM_USER_IDS
+    return user_id in ALLOWED_TELEGRAM_USER_IDS
+
+
+class AccessMiddleware(BaseMiddleware):
+    """Blocks every message/button tap from users not in ALLOWED_TELEGRAM_USER_IDS."""
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = data.get("event_from_user")
+        if user and not _allowed_user_id(user.id):
+            if isinstance(event, CallbackQuery):
+                await event.answer("У вас нет доступа к этому боту.", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("У вас нет доступа к этому боту.")
+            return
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(AccessMiddleware())
+dp.callback_query.outer_middleware(AccessMiddleware())
 
 
 def _ensure_login():
@@ -69,23 +99,43 @@ def _parse_number(text: str) -> float | None:
         return None
 
 
+def _main_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📤 Списать товар", callback_data="menu:decommission"),
+                InlineKeyboardButton(text="📥 Оприходовать", callback_data="menu:debit"),
+            ],
+            [
+                InlineKeyboardButton(text="🆕 Новый товар", callback_data="menu:create_product"),
+                InlineKeyboardButton(text="💰 Отчёт по кассе", callback_data="menu:cash_report"),
+            ],
+        ]
+    )
+
+
+async def _show_main_menu(message: Message, text: str = "Что делаем?"):
+    await message.answer(text, reply_markup=_main_menu_markup())
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "Привет! Напиши, например:\n"
-        "«списать 2 пирожных тирамису, испортились»\n"
-        "«оприходовать 10 кофе капучино по 800»\n"
-        "«добавить новый товар»\n"
-        "«отчёт по кассе за сегодня»"
+        "Привет! Я помогу вести учёт в UMAG.\n\n"
+        "Выбери действие кнопкой ниже, или просто напиши текстом, например:\n"
+        "«списать 2 пирожных тирамису, испортились»"
     )
+    await _show_main_menu(message)
+
+
+@dp.message(F.text == "/menu")
+async def menu_command(message: Message, state: FSMContext):
+    await state.clear()
+    await _show_main_menu(message)
 
 
 @dp.message(StateFilter(None), F.text)
 async def handle_text(message: Message, state: FSMContext):
-    if not _allowed(message):
-        await message.answer("У вас нет доступа к этому боту.")
-        return
-
     try:
         _ensure_login()
     except UmagError as e:
@@ -206,6 +256,31 @@ async def cash_evening_entered(message: Message, state: FSMContext):
         f"📍Деньги вечером: {evening:,.0f} тг\n"
         f"Изл/нед: {diff:+,.0f} тг"
     )
+    await _show_main_menu(message)
+
+
+@dp.message(CashCheck.custom_date, F.text)
+async def cash_custom_date_entered(message: Message, state: FSMContext):
+    parsed = parse_message(f"отчёт по кассе за {message.text}")
+    if parsed.get("action") != "cash_report" or not (parsed.get("specific_date") or parsed.get("period_days")):
+        await message.answer("Не понял дату. Напиши, например: 11 июля или 2026-07-11.")
+        return
+    await _handle_cash_report(message, parsed, state)
+
+
+def _period_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Сегодня", callback_data="period:today"),
+                InlineKeyboardButton(text="Вчера", callback_data="period:yesterday"),
+            ],
+            [
+                InlineKeyboardButton(text="3 дня", callback_data="period:3days"),
+                InlineKeyboardButton(text="📅 Указать дату", callback_data="period:customdate"),
+            ],
+        ]
+    )
 
 
 async def _handle_stock_action(message: Message, parsed: dict):
@@ -249,6 +324,163 @@ async def _handle_stock_action(message: Message, parsed: dict):
         f"по {price}?",
         reply_markup=kb,
     )
+
+
+# ----------------------------------------------------- guided menu flow
+
+def _stock_verb(action: str) -> str:
+    return "списать" if action == "decommission" else "оприходовать"
+
+
+@dp.message(StockFlow.product, F.text)
+async def stock_product_entered(message: Message, state: FSMContext):
+    query = message.text.strip()
+    matches = umag.search_product(query)
+    if not matches:
+        await message.answer(f"Товар «{query}» не найден. Попробуй другое название.")
+        return
+
+    if len(matches) == 1:
+        await _pick_stock_product(message, state, matches[0])
+        return
+
+    _search_results[message.chat.id] = matches[:8]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{m['name']} · {m.get('arrivalCost', 0):,.0f} тг",
+                    callback_data=f"pickprod:{i}",
+                )
+            ]
+            for i, m in enumerate(matches[:8])
+        ]
+    )
+    await message.answer("Нашлось несколько товаров, выбери нужный:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("pickprod:"))
+async def pick_product_callback(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split(":", 1)[1])
+    matches = _search_results.get(callback.message.chat.id, [])
+    if idx >= len(matches):
+        await callback.answer("Список устарел, начни заново с /menu.")
+        return
+    await _pick_stock_product(callback.message, state, matches[idx])
+    await callback.answer()
+
+
+async def _pick_stock_product(message: Message, state: FSMContext, product: dict):
+    await state.update_data(
+        barcode=product["barcode"],
+        name=product["name"],
+        price=product.get("arrivalCost") or product.get("sellingPrice") or 0,
+        measure=product.get("measureName", "шт."),
+    )
+    await state.set_state(StockFlow.quantity)
+    await message.answer(f"«{product['name']}» — сколько (шт.)?")
+
+
+@dp.message(StockFlow.quantity, F.text)
+async def stock_quantity_entered(message: Message, state: FSMContext):
+    value = _parse_number(message.text)
+    if value is None:
+        await message.answer("Не понял число. Введи количество цифрами.")
+        return
+    await state.update_data(quantity=value)
+    data = await state.get_data()
+    if data["action"] == "decommission":
+        await state.set_state(StockFlow.comment)
+        await message.answer("Причина списания? (или напиши \"-\", если не важно)")
+    else:
+        await _finish_stock_flow(message, state)
+
+
+@dp.message(StockFlow.comment, F.text)
+async def stock_comment_entered(message: Message, state: FSMContext):
+    comment = "" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(comment=comment)
+    await _finish_stock_flow(message, state)
+
+
+async def _finish_stock_flow(message: Message, state: FSMContext):
+    data = await state.get_data()
+    token = f"{message.from_user.id}:{message.message_id}"
+    _pending[token] = {
+        "kind": "stock_action",
+        "action": data["action"],
+        "barcode": data["barcode"],
+        "name": data["name"],
+        "quantity": data["quantity"],
+        "price": data["price"],
+        "comment": data.get("comment", ""),
+    }
+    verb = "Списать" if data["action"] == "decommission" else "Оприходовать"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, подтверждаю", callback_data=f"confirm:{token}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel:{token}"),
+            ]
+        ]
+    )
+    await message.answer(
+        f"{verb} «{data['name']}» — {data['quantity']} {data.get('measure', 'шт.')}?",
+        reply_markup=kb,
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def menu_selected(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+
+    try:
+        _ensure_login()
+    except UmagError as e:
+        await callback.message.edit_text(f"Не удалось подключиться к UMAG: {e}")
+        await callback.answer()
+        return
+
+    await state.clear()
+
+    if action in ("decommission", "debit"):
+        await state.update_data(action=action)
+        await state.set_state(StockFlow.product)
+        await callback.message.edit_text(f"Какой товар {_stock_verb(action)}? Напиши название.")
+    elif action == "create_product":
+        await _advance_product_creation(callback.message, state)
+    elif action == "cash_report":
+        await callback.message.edit_text("За какой период отчёт?", reply_markup=_period_menu_markup())
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("period:"))
+async def period_selected(callback: CallbackQuery, state: FSMContext):
+    choice = callback.data.split(":", 1)[1]
+
+    if choice == "customdate":
+        await state.set_state(CashCheck.custom_date)
+        await callback.message.edit_text("Напиши дату, например: 11 июля или 2026-07-11")
+        await callback.answer()
+        return
+
+    parsed = {
+        "today": {"period_days": 1},
+        "yesterday": {"specific_date": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")},
+        "3days": {"period_days": 3},
+    }[choice]
+
+    try:
+        _ensure_login()
+    except UmagError as e:
+        await callback.message.edit_text(f"Не удалось подключиться к UMAG: {e}")
+        await callback.answer()
+        return
+
+    await callback.answer()
+    await _handle_cash_report(callback.message, parsed, state)
 
 
 # ------------------------------------------------------- create new product
@@ -405,6 +637,7 @@ async def confirm_action(callback: CallbackQuery):
     except UmagError as e:
         await callback.message.edit_text(f"Ошибка: {e}")
     await callback.answer()
+    await _show_main_menu(callback.message)
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
@@ -413,6 +646,7 @@ async def cancel_action(callback: CallbackQuery):
     _pending.pop(token, None)
     await callback.message.edit_text("Отменено.")
     await callback.answer()
+    await _show_main_menu(callback.message)
 
 
 async def _run_health_server():
