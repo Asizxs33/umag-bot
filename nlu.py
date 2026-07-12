@@ -72,7 +72,58 @@ TOOLS = [
     }
 ]
 
+PRODUCT_LIST_TOOL = {
+    "name": "parse_product_list",
+    "description": (
+        "Split a free-form message into individual product lines with quantities. "
+        "The message may be one product ('тирамису 2 шт') or a multi-line list, one "
+        "product per line, in any human phrasing (dashes, 'x2', 'по 3 шт', etc.)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "product_query": {
+                            "type": "string",
+                            "description": "Название товара как его написал пользователь, без количества.",
+                        },
+                        "quantity": {
+                            "type": "number",
+                            "description": "Количество для этого товара. Если не указано явно, поставь 1.",
+                        },
+                    },
+                    "required": ["product_query", "quantity"],
+                },
+            }
+        },
+        "required": ["items"],
+    },
+}
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def parse_product_list(text: str) -> list[dict]:
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        tools=[PRODUCT_LIST_TOOL],
+        tool_choice={"type": "tool", "name": "parse_product_list"},
+        messages=[
+            {
+                "role": "user",
+                "content": f"Разбери список товаров построчно и вызови parse_product_list.\n\nСообщение: {text}",
+            }
+        ],
+    )
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == "parse_product_list":
+            return block.input.get("items", [])
+    return []
 
 
 def parse_message(text: str) -> dict:

@@ -19,7 +19,7 @@ from aiogram.types import (
 )
 
 from config import ALLOWED_TELEGRAM_USER_IDS, TELEGRAM_BOT_TOKEN, UMAG_PASSWORD, UMAG_PHONE
-from nlu import parse_message
+from nlu import parse_message, parse_product_list
 from umag_client import UmagClient, UmagError
 
 logging.basicConfig(level=logging.INFO)
@@ -49,12 +49,7 @@ class CashCheck(StatesGroup):
 
 class StockFlow(StatesGroup):
     product = State()
-    quantity = State()
     comment = State()
-
-
-# per-chat search results awaiting a pick via inline buttons
-_search_results: dict[int, list[dict]] = {}
 
 
 # last confirmed "Деньги вечером" per chat, used as next day's "Деньги утром"
@@ -283,47 +278,59 @@ def _period_menu_markup() -> InlineKeyboardMarkup:
     )
 
 
-async def _handle_stock_action(message: Message, parsed: dict):
-    product_query = parsed.get("product_query")
-    if not product_query:
-        await message.answer("Не понял, какой товар. Укажи название явно.")
-        return
+def _build_cart(text: str) -> tuple[list[dict], list[str]]:
+    """Parses free text (one product or a multi-line list) into resolved
+    UMAG products. Returns (cart, not_found_queries)."""
+    items = parse_product_list(text)
+    cart: list[dict] = []
+    not_found: list[str] = []
+    for item in items:
+        query = (item.get("product_query") or "").strip()
+        if not query:
+            continue
+        quantity = item.get("quantity") or 1
+        matches = umag.search_product(query)
+        if not matches:
+            not_found.append(query)
+            continue
+        product = matches[0]
+        cart.append(
+            {
+                "barcode": product["barcode"],
+                "name": product["name"],
+                "quantity": quantity,
+                "price": product.get("arrivalCost") or product.get("sellingPrice") or 0,
+                "measure": product.get("measureName", "шт."),
+            }
+        )
+    return cart, not_found
 
-    matches = umag.search_product(product_query)
-    if not matches:
-        await message.answer(f"Товар «{product_query}» не найден в номенклатуре.")
-        return
 
-    product = matches[0]
-    quantity = parsed.get("quantity") or 1
-    action = parsed["action"]
-    price = product.get("arrivalCost") or product.get("sellingPrice") or 0
-
+async def _present_cart(message: Message, action: str, cart: list[dict], comment: str = ""):
     token = f"{message.from_user.id}:{message.message_id}"
-    _pending[token] = {
-        "kind": "stock_action",
-        "action": action,
-        "barcode": product["barcode"],
-        "name": product["name"],
-        "quantity": quantity,
-        "price": price,
-        "comment": parsed.get("comment", "") or "",
-    }
+    _pending[token] = {"kind": "stock_action", "action": action, "items": cart, "comment": comment}
 
     verb = "Списать" if action == "decommission" else "Оприходовать"
+    items_text = "\n".join(f"• {it['name']} — {it['quantity']:g} {it.get('measure', 'шт.')}" for it in cart)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Да, подтверждаю", callback_data=f"confirm:{token}"),
-                InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{token}"),
+                InlineKeyboardButton(text="✅ Да, подтверждаю", callback_data=f"confirm:{token}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel:{token}"),
             ]
         ]
     )
-    await message.answer(
-        f"{verb} «{product['name']}» — {quantity} {product.get('measureName', 'шт.')} "
-        f"по {price}?",
-        reply_markup=kb,
-    )
+    await message.answer(f"{verb}:\n{items_text}", reply_markup=kb)
+
+
+async def _handle_stock_action(message: Message, parsed: dict):
+    cart, not_found = _build_cart(message.text)
+    if not cart:
+        await message.answer("Не нашёл такой товар в номенклатуре. Попробуй другое название.")
+        return
+    if not_found:
+        await message.answer(f"⚠️ Не нашёл: {', '.join(not_found)} — их пропускаю.")
+    await _present_cart(message, parsed["action"], cart, parsed.get("comment", "") or "")
 
 
 # ----------------------------------------------------- guided menu flow
@@ -334,64 +341,18 @@ def _stock_verb(action: str) -> str:
 
 @dp.message(StockFlow.product, F.text)
 async def stock_product_entered(message: Message, state: FSMContext):
-    query = message.text.strip()
-    matches = umag.search_product(query)
-    if not matches:
-        await message.answer(f"Товар «{query}» не найден. Попробуй другое название.")
+    cart, not_found = _build_cart(message.text)
+    if not cart:
+        await message.answer("Не нашёл ни один товар. Напиши название ещё раз, можно списком по одному в строке.")
         return
 
-    if len(matches) == 1:
-        await _pick_stock_product(message, state, matches[0])
-        return
-
-    _search_results[message.chat.id] = matches[:8]
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"{m['name']} · {m.get('arrivalCost', 0):,.0f} тг",
-                    callback_data=f"pickprod:{i}",
-                )
-            ]
-            for i, m in enumerate(matches[:8])
-        ]
-    )
-    await message.answer("Нашлось несколько товаров, выбери нужный:", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("pickprod:"))
-async def pick_product_callback(callback: CallbackQuery, state: FSMContext):
-    idx = int(callback.data.split(":", 1)[1])
-    matches = _search_results.get(callback.message.chat.id, [])
-    if idx >= len(matches):
-        await callback.answer("Список устарел, начни заново с /menu.")
-        return
-    await _pick_stock_product(callback.message, state, matches[idx])
-    await callback.answer()
-
-
-async def _pick_stock_product(message: Message, state: FSMContext, product: dict):
-    await state.update_data(
-        barcode=product["barcode"],
-        name=product["name"],
-        price=product.get("arrivalCost") or product.get("sellingPrice") or 0,
-        measure=product.get("measureName", "шт."),
-    )
-    await state.set_state(StockFlow.quantity)
-    await message.answer(f"«{product['name']}» — сколько (шт.)?")
-
-
-@dp.message(StockFlow.quantity, F.text)
-async def stock_quantity_entered(message: Message, state: FSMContext):
-    value = _parse_number(message.text)
-    if value is None:
-        await message.answer("Не понял число. Введи количество цифрами.")
-        return
-    await state.update_data(quantity=value)
+    await state.update_data(cart=cart, not_found=not_found)
     data = await state.get_data()
+
     if data["action"] == "decommission":
         await state.set_state(StockFlow.comment)
-        await message.answer("Причина списания? (или напиши \"-\", если не важно)")
+        note = f"⚠️ Не нашёл: {', '.join(not_found)}\n\n" if not_found else ""
+        await message.answer(f"{note}Причина списания (одна на все товары)? Или напиши \"-\".")
     else:
         await _finish_stock_flow(message, state)
 
@@ -405,29 +366,10 @@ async def stock_comment_entered(message: Message, state: FSMContext):
 
 async def _finish_stock_flow(message: Message, state: FSMContext):
     data = await state.get_data()
-    token = f"{message.from_user.id}:{message.message_id}"
-    _pending[token] = {
-        "kind": "stock_action",
-        "action": data["action"],
-        "barcode": data["barcode"],
-        "name": data["name"],
-        "quantity": data["quantity"],
-        "price": data["price"],
-        "comment": data.get("comment", ""),
-    }
-    verb = "Списать" if data["action"] == "decommission" else "Оприходовать"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Да, подтверждаю", callback_data=f"confirm:{token}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel:{token}"),
-            ]
-        ]
-    )
-    await message.answer(
-        f"{verb} «{data['name']}» — {data['quantity']} {data.get('measure', 'шт.')}?",
-        reply_markup=kb,
-    )
+    not_found = data.get("not_found") or []
+    if not_found:
+        await message.answer(f"⚠️ Не нашёл: {', '.join(not_found)} — их пропускаю.")
+    await _present_cart(message, data["action"], data["cart"], data.get("comment", ""))
     await state.clear()
 
 
@@ -447,7 +389,10 @@ async def menu_selected(callback: CallbackQuery, state: FSMContext):
     if action in ("decommission", "debit"):
         await state.update_data(action=action)
         await state.set_state(StockFlow.product)
-        await callback.message.edit_text(f"Какой товар {_stock_verb(action)}? Напиши название.")
+        await callback.message.edit_text(
+            f"Какой товар {_stock_verb(action)}? Можно списком, по одному на строку:\n"
+            f"Тирамису 2\nМедовик 1"
+        )
     elif action == "create_product":
         await _advance_product_creation(callback.message, state)
     elif action == "cash_report":
@@ -614,26 +559,21 @@ async def confirm_action(callback: CallbackQuery):
             )
             await callback.message.edit_text(f"✅ Товар «{pending['name']}» создан.")
         elif pending["action"] == "decommission":
-            product_line = {
-                "barcode": pending["barcode"],
-                "quantity": pending["quantity"],
-                "price": pending["price"],
-                "comment": pending["comment"],
-                "type": 1,  # "Испорченный"
-            }
+            comment = pending.get("comment", "")
+            lines = [
+                {"barcode": it["barcode"], "quantity": it["quantity"], "price": it["price"], "comment": comment, "type": 1}
+                for it in pending["items"]
+            ]
             doc = umag.create_decommission()
-            umag.add_decommission_products(doc["id"], [product_line])
+            umag.add_decommission_products(doc["id"], lines)
             umag.provide_decommission(doc["id"])
-            await callback.message.edit_text(f"✅ Проведено (№{doc['id']}).")
+            await callback.message.edit_text(f"✅ Проведено (№{doc['id']}), позиций: {len(lines)}.")
         else:
-            product_line = {
-                "barcode": pending["barcode"],
-                "quantity": pending["quantity"],
-            }
+            lines = [{"barcode": it["barcode"], "quantity": it["quantity"]} for it in pending["items"]]
             doc = umag.create_debit()
-            umag.add_debit_products(doc["id"], [product_line])
+            umag.add_debit_products(doc["id"], lines)
             umag.provide_debit(doc["id"])
-            await callback.message.edit_text(f"✅ Проведено (№{doc['id']}).")
+            await callback.message.edit_text(f"✅ Проведено (№{doc['id']}), позиций: {len(lines)}.")
     except UmagError as e:
         await callback.message.edit_text(f"Ошибка: {e}")
     await callback.answer()
