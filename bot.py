@@ -299,7 +299,8 @@ def _build_cart(text: str) -> tuple[list[dict], list[str]]:
                 "barcode": product["barcode"],
                 "name": product["name"],
                 "quantity": quantity,
-                "price": product.get("arrivalCost") or product.get("sellingPrice") or 0,
+                "arrival_cost": product.get("arrivalCost") or 0,
+                "selling_price": product.get("sellingPrice") or 0,
                 "measure": product.get("measureName", "шт."),
             }
         )
@@ -311,7 +312,11 @@ async def _present_cart(message: Message, action: str, cart: list[dict], comment
     _pending[token] = {"kind": "stock_action", "action": action, "items": cart, "comment": comment}
 
     verb = "Списать" if action == "decommission" else "Оприходовать"
-    items_text = "\n".join(f"• {it['name']} — {it['quantity']:g} {it.get('measure', 'шт.')}" for it in cart)
+    price_key = "arrival_cost" if action == "decommission" else "selling_price"
+    items_text = "\n\n".join(
+        f"{it['name']}\nКол-во: {it['quantity']:g} {it.get('measure', 'шт.')}\nЦена: {it[price_key]:,.0f}тг"
+        for it in cart
+    )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -320,7 +325,7 @@ async def _present_cart(message: Message, action: str, cart: list[dict], comment
             ]
         ]
     )
-    await message.answer(f"{verb}:\n{items_text}", reply_markup=kb)
+    await message.answer(f"{verb}:\n\n{items_text}", reply_markup=kb)
 
 
 async def _handle_stock_action(message: Message, parsed: dict):
@@ -561,7 +566,13 @@ async def confirm_action(callback: CallbackQuery):
         elif pending["action"] == "decommission":
             comment = pending.get("comment", "")
             lines = [
-                {"barcode": it["barcode"], "quantity": it["quantity"], "price": it["price"], "comment": comment, "type": 1}
+                {
+                    "barcode": it["barcode"],
+                    "quantity": it["quantity"],
+                    "price": it["arrival_cost"],
+                    "comment": comment,
+                    "type": 1,
+                }
                 for it in pending["items"]
             ]
             doc = umag.create_decommission()
