@@ -40,6 +40,10 @@ class NewProduct(StatesGroup):
     category = State()
 
 
+class CashCheck(StatesGroup):
+    actual_cash = State()
+
+
 def _allowed(message: Message) -> bool:
     if not ALLOWED_TELEGRAM_USER_IDS:
         return True
@@ -87,7 +91,7 @@ async def handle_text(message: Message, state: FSMContext):
     action = parsed.get("action")
 
     if action == "cash_report":
-        await _handle_cash_report(message, parsed)
+        await _handle_cash_report(message, parsed, state)
     elif action in ("decommission", "debit"):
         await _handle_stock_action(message, parsed)
     elif action == "create_product":
@@ -100,42 +104,78 @@ async def handle_text(message: Message, state: FSMContext):
         )
 
 
-async def _handle_cash_report(message: Message, parsed: dict):
+CASH_ACCOUNT_NAME = "Касса-1"
+
+
+async def _handle_cash_report(message: Message, parsed: dict, state: FSMContext):
     days = int(parsed.get("period_days") or 1)
     date_to = datetime.now()
-    date_from = date_to - timedelta(days=days)
+    date_from = (date_to - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
     try:
-        reports = umag.list_z_reports(date_from, date_to)
+        pnl = umag.profit_and_loss(date_from, date_to)
+        cash_balance = umag.get_cash_account_balance(CASH_ACCOUNT_NAME)
     except UmagError as e:
         await message.answer(f"Ошибка получения отчёта: {e}")
         return
 
-    if not reports:
-        await message.answer("За этот период кассовых смен не найдено.")
+    pr = pnl.get("profitReport", {})
+    revenue = pr.get("revenueAmount", 0)
+    cash_sales = pr.get("saleCashAmount", 0)
+    bank_sales = pr.get("saleBankAmount", 0)
+
+    expenses = [e for e in pnl.get("expenses", []) if e.get("amount")]
+    total_expense = sum(e["amount"] for e in expenses)
+
+    decommissions = [d for d in pnl.get("decommissionSums", []) if d.get("amount")]
+    total_decom = sum(d["amount"] for d in decommissions)
+
+    lines = [
+        f"Отчёт по кассе с {date_from.strftime('%d.%m')} по {date_to.strftime('%d.%m %H:%M')}:\n",
+        f"Выручка: {revenue:,.0f} ₸ (нал {cash_sales:,.0f} / безнал {bank_sales:,.0f})",
+    ]
+    if expenses:
+        lines.append("\nРасходы:")
+        for e in expenses:
+            lines.append(f"  {e['name']}: {e['amount']:,.0f} ₸")
+        lines.append(f"Итого расходов: {total_expense:,.0f} ₸")
+    if decommissions:
+        lines.append(f"\nСписания: {total_decom:,.0f} ₸")
+
+    if cash_balance is not None:
+        lines.append(f"\n💰 Текущий остаток по системе ({CASH_ACCOUNT_NAME}): {cash_balance:,.0f} ₸")
+        await state.update_data(expected_cash=cash_balance)
+        await state.set_state(CashCheck.actual_cash)
+        lines.append("\nСколько по факту наличных в кассе? (напиши число, или \"пропустить\")")
+    else:
+        lines.append(f"\n(счёт «{CASH_ACCOUNT_NAME}» не найден — сверка остатка недоступна)")
+
+    await message.answer("\n".join(lines))
+
+
+@dp.message(CashCheck.actual_cash, F.text)
+async def cash_check_entered(message: Message, state: FSMContext):
+    if message.text.strip().lower() in ("пропустить", "skip", "-"):
+        await state.clear()
+        await message.answer("Ок, без сверки.")
         return
 
-    lines = [f"Кассовые смены за последние {days} дн.:\n"]
-    total_income = total_expense = 0
-    for r in reports:
-        z = r["posZReport"]
-        acc = r["accountReport"]
-        income = acc.get("totalIncome", 0)
-        expense = acc.get("totalExpense", 0)
-        total_income += income
-        total_expense += expense
-        open_time = datetime.fromtimestamp(z["openTime"] / 1000).strftime("%d.%m %H:%M")
-        close_time = (
-            datetime.fromtimestamp(z["reportTime"] / 1000).strftime("%d.%m %H:%M")
-            if z.get("reportTime")
-            else "открыта"
-        )
-        cashier = f"{r['user'].get('firstName', '')} {r['user'].get('lastName', '')}".strip()
-        lines.append(
-            f"№{z['id']} | {r['pos'].get('name', '?')} | {cashier} | "
-            f"{open_time} — {close_time} | приход {income} / расход {expense}"
-        )
-    lines.append(f"\nИтого приход: {total_income}, расход: {total_expense}")
-    await message.answer("\n".join(lines))
+    actual = _parse_number(message.text)
+    if actual is None:
+        await message.answer("Не понял число. Введи фактический остаток наличных цифрами, или \"пропустить\".")
+        return
+
+    data = await state.get_data()
+    expected = data.get("expected_cash", 0)
+    diff = actual - expected
+    await state.clear()
+
+    if abs(diff) < 1:
+        await message.answer(f"Сходится ✅ (факт {actual:,.0f} ₸)")
+    elif diff > 0:
+        await message.answer(f"Излишек: +{diff:,.0f} ₸ (по системе {expected:,.0f}, по факту {actual:,.0f})")
+    else:
+        await message.answer(f"Недостача: {diff:,.0f} ₸ (по системе {expected:,.0f}, по факту {actual:,.0f})")
 
 
 async def _handle_stock_action(message: Message, parsed: dict):

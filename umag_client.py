@@ -229,6 +229,40 @@ class UmagClient:
         }
         return self._get("/opr/pos-z-report/list", params=params).get("data", [])
 
+    def list_accounts(self) -> list[dict]:
+        """Счета магазина: [{id, name, type, value, ...}]. `value` is the
+        account's current live balance, maintained automatically by UMAG
+        (revenue in, expenses out) -- this is what the "Касса-1" cash count
+        should match at end of day. Confirmed live 2026-07-12."""
+        return self._get("/fin/account/list", params={"storeId": self.store_id}).get("accounts", [])
+
+    def get_cash_account_balance(self, name: str = "Касса-1") -> float | None:
+        for acc in self.list_accounts():
+            if acc["name"] == name:
+                return acc["value"]
+        return None
+
+    def profit_and_loss(self, date_from: datetime, date_to: datetime) -> dict:
+        """Выручка (нал/безнал), расходы по статьям, списания -- за период.
+        Confirmed live 2026-07-12 against "Отчёты -> Прибыли и убытки"."""
+        params = {
+            "fromTime": int(date_from.timestamp() * 1000),
+            "toTime": int(date_to.timestamp() * 1000),
+            "storeId": self.store_id,
+        }
+        return self._get("/report/profit-and-loss", params=params)
+
+    def list_payments(self, date_from: datetime, date_to: datetime) -> list[dict]:
+        """Raw itemized payments (приход/расход) for the period."""
+        params = {
+            "fromTime": int(date_from.timestamp() * 1000),
+            "toTime": int(date_to.timestamp() * 1000),
+            "first": 0,
+            "pageSize": 200,
+            "storeId": self.store_id,
+        }
+        return self._get("/fin/payment/list-store-payments", params=params).get("payments", [])
+
     @staticmethod
     def _date_range_params(date_from: datetime, date_to: datetime) -> dict[str, Any]:
         f = date_from.strftime("%Y-%m-%dT%H:%M:%S.000Z")
