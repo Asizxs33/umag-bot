@@ -44,7 +44,11 @@ TOOLS = [
                 },
                 "period_days": {
                     "type": "integer",
-                    "description": "Для cash_report: за сколько последних дней нужен отчёт (по умолчанию 1 = сегодня).",
+                    "description": "Для cash_report: за сколько последних дней нужен отчёт (по умолчанию 1 = сегодня). Не указывай, если пользователь назвал конкретную дату (тогда используй specific_date).",
+                },
+                "specific_date": {
+                    "type": "string",
+                    "description": "Для cash_report: конкретная дата в формате YYYY-MM-DD, если пользователь назвал день явно (например 'за 11 июля').",
                 },
                 "product_name": {
                     "type": "string",
