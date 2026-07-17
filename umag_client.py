@@ -71,16 +71,22 @@ class UmagClient:
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = self._http.get(path, params=params, headers=self._headers())
+        if resp.status_code == 401 and self._session_token is not None:
+            self.login()
+            resp = self._http.get(path, params=params, headers=self._headers())
         return self._unwrap(resp)
 
     def _post(self, path: str, json: Any = None, params: dict[str, Any] | None = None) -> Any:
-        resp = self._http.post(path, json=json if json is not None else {}, params=params, headers=self._headers())
+        body = json if json is not None else {}
+        resp = self._http.post(path, json=body, params=params, headers=self._headers())
+        if resp.status_code == 401 and self._session_token is not None:
+            self.login()
+            resp = self._http.post(path, json=body, params=params, headers=self._headers())
         return self._unwrap(resp)
 
     def _unwrap(self, resp: httpx.Response) -> Any:
         if resp.status_code == 401:
-            # session expired mid-run; caller should re-login and retry once
-            raise UmagError("Wrong/expired session")
+            raise UmagError("Сессия umag истекла и повторный вход не помог — проверь UMAG_PHONE/UMAG_PASSWORD")
         if resp.status_code >= 400:
             raise UmagError(f"{resp.request.method} {resp.request.url} -> {resp.status_code}: {resp.text}")
         if not resp.content:
@@ -162,12 +168,14 @@ class UmagClient:
         }
         headers = self._headers()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-        resp = self._http.post(
-            "/nom/product/create",
-            data=form,
-            params={"storeId": self.store_id},
-            headers=headers,
-        )
+        resp = self._http.post("/nom/product/create", data=form, params={"storeId": self.store_id}, headers=headers)
+        if resp.status_code == 401 and self._session_token is not None:
+            self.login()
+            headers = self._headers()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            resp = self._http.post(
+                "/nom/product/create", data=form, params={"storeId": self.store_id}, headers=headers
+            )
         self._unwrap(resp)
 
     # -------------------------------------------------------- decommission
